@@ -1,0 +1,59 @@
+name: Private M2 Linux test build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/m2-linux-20261019]
+
+permissions:
+  contents: read
+
+jobs:
+  test-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install native and static build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools build-essential pkg-config clang cmake
+          rustup toolchain install 1.95.0 --profile minimal --target x86_64-unknown-linux-musl
+          rustup default 1.95.0
+      - name: Isolate SQLx compile fixture
+        run: |
+          cp db_v2.sqlite3 "$RUNNER_TEMP/m2-schema.sqlite3"
+          echo "DATABASE_URL=sqlite://$RUNNER_TEMP/m2-schema.sqlite3" >> "$GITHUB_ENV"
+      - name: Test channel and actual client registration
+        run: |
+          cargo test --locked --manifest-path libs/hbb_common/Cargo.toml --test private_tcp_channel --test private_tcp_registration
+          cargo test --locked --manifest-path libs/hbb_common/Cargo.toml --lib private_tcp::
+      - name: Test isolated server runtime
+        run: cargo test --locked --lib private_tcp
+      - name: Build static Linux binaries
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl --bin hbbs --bin hbbr
+      - name: Verify static executables and record provenance
+        run: |
+          mkdir -p m2-linux
+          cp target/x86_64-unknown-linux-musl/release/hbbs target/x86_64-unknown-linux-musl/release/hbbr m2-linux/
+          file m2-linux/hbbs m2-linux/hbbr
+          if readelf -l m2-linux/hbbs m2-linux/hbbr | grep -q INTERP; then
+            echo 'Expected static Linux binaries' >&2
+            exit 1
+          fi
+          git rev-parse HEAD > m2-linux/server-commit.txt
+          git -C libs/hbb_common rev-parse HEAD > m2-linux/common-commit.txt
+          (cd m2-linux && sha256sum hbbs hbbr > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: private-m2-linux-x86_64
+          path: m2-linux/
+          if-no-files-found: error
+          retention-days: 14
