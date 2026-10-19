@@ -210,6 +210,11 @@ async fn main() -> ResultType<()> {
     hbb_common::timeout(120_000, async {
         if check_udp {
             udp_registration(host).await?;
+            println!(
+                "{}",
+                serde_json::json!({"server": host, "legacyUdpRegistration": true,
+                "stage": "udp_accepted", "remoteDesktopAccepted": false})
+            );
         }
         for generation in 0..3 {
             let mut stream = connect(host).await?;
