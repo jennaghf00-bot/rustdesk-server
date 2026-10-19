@@ -124,6 +124,33 @@ impl Database {
         Ok(guid)
     }
 
+    pub(crate) async fn admit_private(
+        &self, id: &str, uuid: &[u8], pk: &[u8], info: &str,
+    ) -> ResultType<Peer> {
+        let mut connection = self.pool.get().await?;
+        let mut transaction = connection.begin().await?;
+        let existing = sqlx::query_as!(Peer,
+            "select guid, id, uuid, pk, user, status, info from peer where id = ?", id)
+            .fetch_optional(&mut *transaction).await?;
+        let result = if let Some(mut peer) = existing {
+            hbb_common::anyhow::ensure!(peer.uuid == uuid && peer.pk == pk,
+                "private_tcp_identity_mismatch");
+            // Never write the durable key/UUID back from a possibly stale in-memory cache.
+            sqlx::query!("update peer set info=? where guid=?", info, peer.guid)
+                .execute(&mut *transaction).await?;
+            peer.info = info.to_owned();
+            peer
+        } else {
+            let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
+            sqlx::query!("insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)",
+                guid, id, uuid, pk, info).execute(&mut *transaction).await?;
+            Peer { guid, id: id.to_owned(), uuid: uuid.to_vec(), pk: pk.to_vec(),
+                info: info.to_owned(), ..Default::default() }
+        };
+        transaction.commit().await?;
+        Ok(result)
+    }
+
     pub async fn update_pk(
         &self,
         guid: &Vec<u8>,

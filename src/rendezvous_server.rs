@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::peer::*;
+mod private_tcp;
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -73,6 +74,7 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct RendezvousServer {
+    private_connections: private_tcp::PrivateConnections,
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
     pm: PeerMap,
     tx: Sender,
@@ -120,6 +122,7 @@ impl RendezvousServer {
             )
         };
         let mut rs = Self {
+            private_connections: Default::default(),
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
@@ -345,6 +348,11 @@ impl RendezvousServer {
                     let peer = self.pm.get_or(&id).await;
                     let (changed, ip_changed) = {
                         let peer = peer.read().await;
+                        if peer.private_tcp_generation.is_some()
+                            && peer.last_reg_time.elapsed().as_millis() < REG_TIMEOUT as u128 {
+                            drop(peer);
+                            return send_rk_res(socket, addr, TOO_FREQUENT).await;
+                        }
                         if peer.uuid.is_empty() {
                             (true, false)
                         } else {
@@ -406,12 +414,12 @@ impl RendezvousServer {
                             );
                         }
                     }
-                    if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-                    }
+                    let result = if changed {
+                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await
+                    } else { register_pk_response::Result::OK };
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: register_pk_response::Result::OK.into(),
+                        result: result.into(),
                         ..Default::default()
                     });
                     socket.send(&msg_out, addr).await?
@@ -496,11 +504,33 @@ impl RendezvousServer {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                        let id = rf.id.clone();
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        let (peer_addr, private) = {
+                            let peer = peer.read().await;
+                            (peer.socket_addr, peer.private_tcp_generation.is_some())
+                        };
+                        if private {
+                            let allowed = key.is_empty() || msg_out.request_relay().licence_key == key;
+                            let notified = if allowed {
+                                match self.private_connections.notify(&id, msg_out).await {
+                                    Ok(value) => value,
+                                    Err(error) => { log::debug!("private relay dispatch failed: {error}"); false }
+                                }
+                            } else { false };
+                            if !notified {
+                                let mut reply = RendezvousMessage::new();
+                                reply.set_relay_response(RelayResponse {
+                                    refuse_reason: if allowed { "Remote desktop is offline" } else { "Key mismatch" }.to_owned(),
+                                    ..Default::default()
+                                });
+                                allow_err!(self.send_to_tcp_sync(reply, addr).await);
+                            }
+                        } else {
+                            self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        }
                     }
                     return true;
                 }
@@ -575,10 +605,13 @@ impl RendezvousServer {
             } else {
                 ip.to_string() != old.info.ip
             } && !ip.is_loopback();
-            let request_pk = old.pk.is_empty() || ip_change;
+            let private_active = old.private_tcp_generation.is_some()
+                && old.last_reg_time.elapsed().as_millis() < REG_TIMEOUT as u128;
+            let request_pk = old.pk.is_empty() || ip_change || private_active;
             if !request_pk {
                 old.socket_addr = socket_addr;
                 old.last_reg_time = Instant::now();
+                old.private_tcp_generation = None;
             }
             let ip_change = if ip_change && old.reg_pk.0 <= 2 {
                 Some(if old.socket_addr.port() == 0 {
@@ -835,6 +868,11 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        match self.private_punch_dispatch(addr, &ph, key).await? {
+            private_tcp::PrivateDispatch::Queued => return Ok(()),
+            private_tcp::PrivateDispatch::Reply(reply) => return self.send_to_tcp_sync(reply, addr).await,
+            private_tcp::PrivateDispatch::Legacy => {}
+        }
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
             self.tx.send(Data::Msg(msg.into(), addr))?;
@@ -851,6 +889,14 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
+        match self.private_punch_dispatch(addr, &ph, key).await? {
+            private_tcp::PrivateDispatch::Queued => return Ok(()),
+            private_tcp::PrivateDispatch::Reply(reply) => {
+                self.tx.send(Data::Msg(reply.into(), addr))?;
+                return Ok(());
+            }
+            private_tcp::PrivateDispatch::Legacy => {}
+        }
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
         self.tx.send(Data::Msg(
             msg.into(),
@@ -1139,9 +1185,23 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            let mut codec = BytesCodec::new();
+            codec.set_max_packet_length(hbb_common::private_tcp::MAX_PLAINTEXT + 128);
+            let (a, mut b) = Framed::new(stream, codec).split();
             sink = Some(Sink::TcpStream(a));
+            let mut first_message = true;
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+                if first_message {
+                    first_message = false;
+                    if let Ok(message) = RendezvousMessage::parse_from_bytes(&bytes) {
+                        if let Some(rendezvous_message::Union::PrivateTcpHello(hello)) = message.union {
+                            hbb_common::anyhow::ensure!(bytes.len() <= 4096, "private_tcp_handshake_too_large");
+                            if let Some(Sink::TcpStream(sender)) = sink.as_mut() {
+                                return self.private_session(hello, sender, &mut b, addr).await;
+                            }
+                        }
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }

@@ -18,6 +18,11 @@ lazy_static::lazy_static! {
     pub(crate) static ref USER_STATUS: RwLock<UserStatusMap> = Default::default();
     pub(crate) static ref IP_CHANGES: Mutex<IpChangesMap> = Default::default();
 }
+
+#[cfg(test)]
+#[path = "peer/private_tcp_tests.rs"]
+mod private_tcp_tests;
+
 pub const IP_CHANGE_DUR: u64 = 180;
 pub const IP_CHANGE_DUR_X2: u64 = IP_CHANGE_DUR * 2;
 pub const DAY_SECONDS: u64 = 3600 * 24;
@@ -39,6 +44,7 @@ pub(crate) struct Peer {
     pub(crate) info: PeerInfo,
     // pub(crate) disabled: bool,
     pub(crate) reg_pk: (u32, Instant), // how often register_pk
+    pub(crate) private_tcp_generation: Option<Bytes>,
 }
 
 impl Default for Peer {
@@ -53,6 +59,7 @@ impl Default for Peer {
             // user: None,
             // disabled: false,
             reg_pk: (0, get_expired_time()),
+            private_tcp_generation: None,
         }
     }
 }
@@ -82,11 +89,50 @@ impl PeerMap {
             db
         });
         log::info!("DB_URL={}", db);
-        let pm = Self {
-            map: Default::default(),
-            db: database::Database::new(&db).await?,
+        Ok(Self::from_database(database::Database::new(&db).await?))
+    }
+
+    pub(crate) fn from_database(db: database::Database) -> Self {
+        Self { map: Default::default(), db }
+    }
+
+    // Caller must verify the consuming TCP handshake proof before admitting this identity.
+    pub(crate) async fn admit_private(
+        &self, id: &str, uuid: &[u8], pk: &[u8], addr: SocketAddr,
+    ) -> ResultType<LockPeer> {
+        hbb_common::anyhow::ensure!(
+            (6..=64).contains(&id.len()) && !id.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+                && !uuid.is_empty() && uuid.len() <= 256 && pk.len() == 32,
+            "private_tcp_invalid_identity"
+        );
+        let peer = self.get_or(id).await;
+        let mut info = {
+            let current = peer.read().await;
+            if !current.guid.is_empty() || !current.uuid.is_empty() || !current.pk.is_empty() {
+                hbb_common::anyhow::ensure!(current.uuid.as_ref() == uuid && current.pk.as_ref() == pk,
+                    "private_tcp_identity_mismatch");
+            }
+            current.info.clone()
         };
-        Ok(pm)
+        info.ip = addr.ip().to_string();
+        let info_json = serde_json::to_string(&info)
+            .map_err(|_| hbb_common::anyhow::anyhow!("private_tcp_persistence_failed"))?;
+        let saved = self.db.admit_private(id, uuid, pk, &info_json).await.map_err(|error| {
+            if error.to_string() == "private_tcp_identity_mismatch" { error }
+            else { hbb_common::anyhow::anyhow!("private_tcp_persistence_failed") }
+        })?;
+        // Do not hold the peer lock while awaiting SQL. Recheck after the durable transaction.
+        let mut current = peer.write().await;
+        if !current.uuid.is_empty() || !current.pk.is_empty() {
+            hbb_common::anyhow::ensure!(current.uuid.as_ref() == uuid && current.pk.as_ref() == pk,
+                "private_tcp_identity_mismatch");
+        }
+        current.guid = saved.guid;
+        current.uuid = uuid.to_vec().into();
+        current.pk = pk.to_vec().into();
+        current.info = info;
+        drop(current);
+        Ok(peer)
     }
 
     #[inline]
@@ -102,10 +148,14 @@ impl PeerMap {
         log::info!("update_pk {} {:?} {:?} {:?}", id, addr, uuid, pk);
         let (info_str, guid) = {
             let mut w = peer.write().await;
+            if w.private_tcp_generation.is_some() && w.last_reg_time.elapsed().as_millis() < 30_000 {
+                return register_pk_response::Result::TOO_FREQUENT;
+            }
             w.socket_addr = addr;
             w.uuid = uuid.clone();
             w.pk = pk.clone();
             w.last_reg_time = Instant::now();
+            w.private_tcp_generation = None;
             w.info.ip = ip;
             (
                 serde_json::to_string(&w.info).unwrap_or_default(),
