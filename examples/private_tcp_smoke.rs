@@ -27,7 +27,9 @@ fn validate_target(host: &str, public: &str) -> ResultType<()> {
 }
 
 async fn connect(host: &str) -> ResultType<FramedStream> {
-    let stream = hbb_common::timeout(5000, tokio::net::TcpStream::connect(host)).await??;
+    let stream = hbb_common::timeout(5000, tokio::net::TcpStream::connect(host))
+        .await
+        .map_err(|_| anyhow!("probe_connect_timeout: {host}"))??;
     let addr = stream.local_addr()?;
     let mut stream = FramedStream::from(stream, addr);
     stream.set_send_timeout(3000);
@@ -217,9 +219,17 @@ async fn main() -> ResultType<()> {
             );
         }
         for generation in 0..3 {
+            println!(
+                "{}",
+                serde_json::json!({"stage":"connecting", "generation":generation})
+            );
             let mut stream = connect(host).await?;
             let state = ClientHandshake::new(id.clone(), machine.clone(), &device.public_key())?;
             let (mut cipher, _) = register_client(&mut stream, state, &pin, &device).await?;
+            println!(
+                "{}",
+                serde_json::json!({"stage":"registered", "generation":generation})
+            );
             heartbeat(&mut stream, &mut cipher, &id).await?;
             if generation == 0 {
                 for _ in 0..4 {
@@ -227,9 +237,19 @@ async fn main() -> ResultType<()> {
                     heartbeat(&mut stream, &mut cipher, &id).await?;
                 }
             }
-            legacy_route(host, &id, public, &pin, &device, &mut stream, &mut cipher).await?;
+            println!(
+                "{}",
+                serde_json::json!({"stage":"legacy_route", "generation":generation})
+            );
+            legacy_route(host, &id, public, &pin, &device, &mut stream, &mut cipher)
+                .await
+                .map_err(|error| anyhow!("legacy_route_stage: {error}"))?;
             drop(stream);
             tokio::time::sleep(Duration::from_millis(300)).await;
+            println!(
+                "{}",
+                serde_json::json!({"stage":"offline_query", "generation":generation})
+            );
             let mut query = controller(host, &id, public).await?;
             let reply = receive(&mut query).await?;
             ensure!(
