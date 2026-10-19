@@ -168,29 +168,8 @@ async fn authenticate(
 ) -> SessionCipher {
     let client =
         ClientHandshake::new("ZBX-TEST".into(), b"machine".to_vec(), &device.public_key()).unwrap();
-    let mut message = RendezvousMessage::new();
-    message.set_private_tcp_hello(client.hello().clone());
-    stream.send(&message).await.unwrap();
-    let challenge = receive(stream).await;
-    assert!(matches!(
-        challenge.union,
-        Some(rendezvous_message::Union::PrivateTcpChallenge(_))
-    ));
-    let (proof, mut cipher) = client
-        .respond(challenge.private_tcp_challenge(), public, device)
-        .unwrap();
-    message.set_private_tcp_proof(proof);
-    stream.send(&message).await.unwrap();
-    let response = receive(stream).await;
-    let response = cipher.open(response.private_tcp_frame()).unwrap();
-    assert!(matches!(
-        response.union,
-        Some(rendezvous_message::Union::RegisterPkResponse(_))
-    ));
-    assert_eq!(
-        response.register_pk_response().result.enum_value().unwrap(),
-        register_pk_response::Result::OK
-    );
+    let (cipher, keep_alive) = hbb_common::private_tcp::register_client(stream, client, public, device).await.unwrap();
+    assert!(keep_alive <= Duration::from_secs(10));
     cipher
 }
 
